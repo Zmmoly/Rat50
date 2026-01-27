@@ -6,6 +6,7 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.util.Log
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.flex.FlexDelegate
 import java.io.File
 import java.io.FileInputStream
 import java.nio.ByteBuffer
@@ -24,7 +25,9 @@ class SpeechRecognizer(private val context: Context) {
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
     private val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
-    private val inputSize = 16000
+    
+    // ✅ التعديل: نحدد 8 ثوانٍ كحجم ثابت لضمان دقة النموذج السوداني v19
+    private val fixedRequiredSamples = 128000 
     
     interface RecognitionListener {
         fun onTextRecognized(text: String)
@@ -41,71 +44,51 @@ class SpeechRecognizer(private val context: Context) {
         this.listener = listener
     }
     
-    /**
-     * التحقق من تحميل النموذج
-     */
-    fun isModelLoaded(): Boolean {
-        return interpreter != null
-    }
+    fun isModelLoaded(): Boolean = interpreter != null
 
-    /**
-     * تحميل نموذج من ملف خارجي (من ذاكرة الهاتف)
-     * هذه الطريقة الرئيسية الآن - المستخدم يختار الملف
-     */
     fun loadModelFromFile(filePath: String): Boolean {
         return try {
             val file = File(filePath)
-            if (!file.exists()) {
-                Log.e(TAG, "❌ الملف غير موجود: $filePath")
-                listener?.onError("الملف غير موجود")
-                return false
-            }
-            
-            if (!file.name.endsWith(".tflite")) {
-                Log.e(TAG, "❌ صيغة خاطئة: ${file.name}")
-                listener?.onError("الملف يجب أن يكون بصيغة .tflite")
-                return false
-            }
-            
-            Log.d(TAG, "📂 محاولة تحميل: ${file.name} (${file.length()} bytes)")
+            if (!file.exists()) return false
             
             val modelBuffer = loadModelFromPath(file)
+            
+            // ✅ إضافة الـ FlexDelegate الضروري لفك التشفير في النسخة Ultimate
             val options = Interpreter.Options().apply {
                 setNumThreads(4)
+                addDelegate(FlexDelegate())
             }
             
-            Log.d(TAG, "🔧 إنشاء Interpreter...")
             interpreter = Interpreter(modelBuffer, options)
             
-            Log.d(TAG, "✅ تم تحميل النموذج: ${file.name}")
+            // ✅ السطر السحري: إجبار النموذج على قبول 8 ثوانٍ بدلاً من 193 عينة فقط
+            interpreter?.resizeInput(0, intArrayOf(1, fixedRequiredSamples))
+            interpreter?.allocateTensors()
+            
             listener?.onModelLoaded(file.name)
             true
-            
         } catch (e: Exception) {
-            Log.e(TAG, "❌ فشل تحميل النموذج: ${e.message}")
-            Log.e(TAG, "Stack trace:", e)
-            listener?.onError("فشل تحميل النموذج: ${e.message}")
+            listener?.onError("فشل التحميل: ${e.message}")
             false
         }
     }
-    
-    /**
-     * تحميل نموذج من assets (اختياري - للاختبار)
-     */
+
     fun loadModelFromAssets(modelFileName: String = "speech_model.tflite"): Boolean {
         return try {
             val modelBuffer = loadModelFromAssetsInternal(modelFileName)
             val options = Interpreter.Options().apply {
                 setNumThreads(4)
+                addDelegate(FlexDelegate())
             }
             interpreter = Interpreter(modelBuffer, options)
             
-            Log.d(TAG, "✅ تم تحميل النموذج من assets: $modelFileName")
+            // ✅ توسيع المدخلات لـ 128 ألف عينة
+            interpreter?.resizeInput(0, intArrayOf(1, fixedRequiredSamples))
+            interpreter?.allocateTensors()
+            
             listener?.onModelLoaded(modelFileName)
             true
-            
         } catch (e: Exception) {
-            Log.e(TAG, "❌ فشل تحميل النموذج من assets: ${e.message}")
             listener?.onError("لم يتم العثور على النموذج في assets")
             false
         }
@@ -121,69 +104,22 @@ class SpeechRecognizer(private val context: Context) {
         val fileDescriptor = context.assets.openFd(modelFileName)
         val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
         val fileChannel = inputStream.channel
-        val startOffset = fileDescriptor.startOffset
-        val declaredLength = fileDescriptor.declaredLength
-        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+        return fileChannel.map(FileChannel.MapMode.READ_ONLY, fileDescriptor.startOffset, fileDescriptor.declaredLength)
     }
 
     fun startRecording() {
-        if (isRecording) {
-            Log.w(TAG, "⚠️ التسجيل قيد العمل بالفعل")
-            return
-        }
-        
-        if (interpreter == null) {
-            listener?.onError("يرجى تحميل النموذج أولاً")
-            return
-        }
-
+        if (isRecording || interpreter == null) return
         try {
-            audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                sampleRate,
-                channelConfig,
-                audioFormat,
-                bufferSize
-            )
-
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                listener?.onError("فشل تهيئة التسجيل الصوتي")
-                return
-            }
+            audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, channelConfig, audioFormat, bufferSize)
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) return
 
             isRecording = true
             audioRecord?.startRecording()
             listener?.onRecordingStarted()
             
-            Log.d(TAG, "🎤 بدأ التسجيل...")
-
-            Thread {
-                recordAndRecognize()
-            }.start()
-
+            Thread { recordAndRecognize() }.start()
         } catch (e: Exception) {
-            Log.e(TAG, "❌ خطأ في بدء التسجيل: ${e.message}")
-            listener?.onError("فشل بدء التسجيل: ${e.message}")
             isRecording = false
-        }
-    }
-
-    fun stopRecording() {
-        if (!isRecording) {
-            return
-        }
-
-        isRecording = false
-        
-        try {
-            audioRecord?.stop()
-            audioRecord?.release()
-            audioRecord = null
-            
-            listener?.onRecordingStopped()
-            Log.d(TAG, "🛑 توقف التسجيل")
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ خطأ في إيقاف التسجيل: ${e.message}")
         }
     }
 
@@ -191,227 +127,94 @@ class SpeechRecognizer(private val context: Context) {
         val audioBuffer = ShortArray(bufferSize)
         val audioData = mutableListOf<Short>()
         
-        // Get required audio length from model
-        val inputShape = interpreter?.getInputTensor(0)?.shape() ?: intArrayOf(1, 1, 193)
-        // Shape is [batch, sequence, features] - we need the LAST dimension for features
-        val requiredSize = inputShape[inputShape.size - 1]
-        val minSize = maxOf(requiredSize / 4, 32) // At least 32 samples minimum
-        
-        Log.d(TAG, "📊 بدء التسجيل - الحد الأدنى: ${minSize} samples، المطلوب: ${requiredSize} samples")
-        
-        var silenceCount = 0
-        val silenceThreshold = 0.01f
-        val silenceDuration = 10 // ~0.6 seconds of silence to auto-process
-        
         try {
             while (isRecording) {
                 val readSize = audioRecord?.read(audioBuffer, 0, bufferSize) ?: 0
-                
                 if (readSize > 0) {
                     val volume = calculateVolume(audioBuffer, readSize)
                     listener?.onVolumeChanged(volume)
                     
-                    for (i in 0 until readSize) {
-                        audioData.add(audioBuffer[i])
-                    }
+                    for (i in 0 until readSize) audioData.add(audioBuffer[i])
                     
-                    val currentSize = audioData.size
-                    Log.d(TAG, "📊 تم تسجيل: $currentSize/$requiredSize عينة")
-                    
-                    // Detect silence
-                    if (volume < silenceThreshold) {
-                        silenceCount++
-                    } else {
-                        silenceCount = 0
-                    }
-                    
-                    // Three conditions to process:
-                    // 1. Reached required size
-                    // 2. Have minimum AND detected silence
-                    // 3. User stopped recording
-                    
-                    val hasEnoughAudio = currentSize >= minSize
-                    val detectedSilence = silenceCount >= silenceDuration
-                    val reachedRequired = currentSize >= requiredSize
-                    
-                    if (reachedRequired || (hasEnoughAudio && detectedSilence)) {
-                        if (reachedRequired) {
-                            Log.d(TAG, "🎯 وصل إلى $requiredSize samples - بدء المعالجة...")
-                        } else {
-                            Log.d(TAG, "🎯 تم كشف سكوت بعد $currentSize samples - بدء المعالجة...")
-                        }
-                        
-                        val audioArray = audioData.toShortArray()
-                        val text = recognizeSpeech(audioArray)
-                        
-                        if (text.isNotBlank()) {
-                            listener?.onTextRecognized(text)
-                            Log.d(TAG, "✅ النتيجة: '$text'")
-                        } else {
-                            Log.w(TAG, "⚠️ نتيجة فارغة")
-                        }
-                        
-                        // Clear buffer for next recognition
+                    // إرسال الكتلة مرة واحدة عند وصولها لـ 8 ثوانٍ
+                    if (audioData.size >= fixedRequiredSamples) {
+                        processAudioChunk(audioData.take(fixedRequiredSamples).toShortArray())
                         audioData.clear()
-                        silenceCount = 0
-                        Log.d(TAG, "🔄 تم مسح البيانات، جاهز للتسجيل التالي")
                     }
-                } else {
-                    Log.w(TAG, "⚠️ readSize <= 0: $readSize")
                 }
             }
-            
-            // When user stops recording, process remaining audio if enough
-            if (audioData.size >= minSize) {
-                Log.d(TAG, "🎯 توقف التسجيل مع ${audioData.size} samples - معالجة نهائية...")
-                
-                val audioArray = audioData.toShortArray()
-                val text = recognizeSpeech(audioArray)
-                
-                if (text.isNotBlank()) {
-                    listener?.onTextRecognized(text)
-                    Log.d(TAG, "✅ النتيجة النهائية: '$text'")
-                }
-            }
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ خطأ أثناء التسجيل: ${e.message}")
-            e.printStackTrace()
-            listener?.onError("خطأ أثناء التسجيل")
-        }
-        
-        Log.d(TAG, "🏁 انتهت حلقة التسجيل")
+            // معالجة ما تبقى عند الضغط على Stop
+            if (audioData.isNotEmpty()) processAudioChunk(audioData.toShortArray())
+        } catch (e: Exception) { }
     }
 
-    private fun calculateVolume(buffer: ShortArray, size: Int): Float {
-        var sum = 0.0
-        for (i in 0 until size) {
-            sum += (buffer[i] * buffer[i]).toDouble()
-        }
-        val rms = sqrt(sum / size)
-        return (rms / Short.MAX_VALUE).toFloat()
+    private fun processAudioChunk(audioArray: ShortArray) {
+        val text = recognizeSpeech(audioArray)
+        if (text.isNotBlank()) listener?.onTextRecognized(text)
     }
 
     private fun recognizeSpeech(audioData: ShortArray): String {
-        try {
-            // Get input/output tensor info
-            val inputTensor = interpreter?.getInputTensor(0)
-            val outputTensor = interpreter?.getOutputTensor(0)
+        return try {
+            // تجهيز الـ Buffer بالحجم الذي حددناه في الـ Resize (128,000)
+            val inputBuffer = ByteBuffer.allocateDirect(fixedRequiredSamples * 4)
+            inputBuffer.order(ByteOrder.nativeOrder())
             
-            val inputShape = inputTensor?.shape() ?: intArrayOf(1, 128000)
-            val outputShape = outputTensor?.shape() ?: intArrayOf(1, 100)
-            val outputType = outputTensor?.dataType()
-            
-            Log.d(TAG, "📊 Input shape: ${inputShape.contentToString()}")
-            Log.d(TAG, "📊 Output shape: ${outputShape.contentToString()}")
-            Log.d(TAG, "📊 Output type: $outputType")
-            
-            // Get the correct dimension for audio features
-            // Shape is [batch, sequence, features] so we need the LAST dimension
-            val requiredSize = inputShape[inputShape.size - 1]
-            Log.d(TAG, "📊 Required: $requiredSize samples")
-            
-            // Normalize to [-1.0, 1.0] and pad if needed
-            val normalized = FloatArray(requiredSize) { i ->
+            for (i in 0 until fixedRequiredSamples) {
                 if (i < audioData.size) {
-                    audioData[i] / 32768.0f
+                    inputBuffer.putFloat(audioData[i] / 32768.0f)
                 } else {
-                    0.0f // Padding with zeros
+                    inputBuffer.putFloat(0.0f) // Padding
                 }
             }
-            
-            Log.d(TAG, "🔧 Normalized ${audioData.size} samples → $requiredSize")
-            if (audioData.size < requiredSize) {
-                Log.d(TAG, "   Padded with ${requiredSize - audioData.size} zeros")
-            }
-            
-            // Create input buffer
-            val inputBuffer = ByteBuffer.allocateDirect(requiredSize * 4)
-            inputBuffer.order(ByteOrder.nativeOrder())
-            normalized.forEach { inputBuffer.putFloat(it) }
             inputBuffer.rewind()
             
-            // Prepare output buffer (Int32)
-            val maxOutputLength = outputShape.getOrElse(1) { 100 }
-            val outputBuffer = IntArray(maxOutputLength)
+            val outputShape = interpreter?.getOutputTensor(0)?.shape() ?: intArrayOf(1, 100)
+            val outputBuffer = IntArray(outputShape[1])
             
-            Log.d(TAG, "🚀 Running inference...")
             interpreter?.run(inputBuffer, outputBuffer)
-            Log.d(TAG, "✅ Inference completed")
             
-            // Decode CTC output
-            return decodeCTCOutput(outputBuffer)
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error in recognition: ${e.message}")
-            e.printStackTrace()
-            return ""
-        }
+            decodeCTCOutput(outputBuffer)
+        } catch (e: Exception) { "" }
     }
-    
-    /**
-     * CTC Decoding for model output
-     */
+
     private fun decodeCTCOutput(indices: IntArray): String {
         val vocabulary = loadVocabulary()
         val result = StringBuilder()
         var lastIdx = -1
         
-        Log.d(TAG, "🔍 CTC Decoding...")
-        Log.d(TAG, "🔍 Output indices (first 20): ${indices.take(20)}")
-        Log.d(TAG, "🔍 Vocabulary size: ${vocabulary.size}")
-        
-        var validCount = 0
         for (idx in indices) {
-            // Skip blank token (index 0)
-            if (idx == 0) continue
-            
-            // Skip repeated characters (CTC rule)
-            if (idx == lastIdx) continue
-            
-            // Valid character index
-            if (idx > 0 && idx < vocabulary.size) {
-                val char = vocabulary[idx]
-                result.append(char)
-                validCount++
-                
-                if (validCount <= 15) {
-                    Log.d(TAG, "  [$validCount] idx=$idx → '$char'")
-                }
-            } else if (idx != 0) {
-                Log.w(TAG, "  ⚠️ Invalid index: $idx (vocab size: ${vocabulary.size})")
+            if (idx == 0 || idx == lastIdx) {
+                lastIdx = idx
+                continue
             }
-            
+            if (idx < vocabulary.size) result.append(vocabulary[idx])
             lastIdx = idx
         }
-        
-        val decoded = result.toString()
-        Log.d(TAG, "✅ CTC Result: '$decoded' (${validCount} chars)")
-        
-        return decoded
+        return result.toString()
     }
 
     private fun loadVocabulary(): List<String> {
         return try {
-            val vocabulary = mutableListOf<String>()
-            context.assets.open("vocabulary.txt").bufferedReader().useLines { lines ->
-                lines.forEach { line ->
-                    vocabulary.add(line.trim())
-                }
-            }
-            Log.d(TAG, "📚 Loaded vocabulary: ${vocabulary.size} characters")
-            vocabulary
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error loading vocabulary: ${e.message}")
-            emptyList()
-        }
+            context.assets.open("vocabulary.txt").bufferedReader().readLines().map { it.trim() }
+        } catch (e: Exception) { emptyList() }
+    }
+
+    private fun calculateVolume(buffer: ShortArray, size: Int): Float {
+        var sum = 0.0
+        for (i in 0 until size) sum += (buffer[i] * buffer[i]).toDouble()
+        return (sqrt(sum / size) / Short.MAX_VALUE).toFloat()
+    }
+
+    fun stopRecording() {
+        isRecording = false
+        audioRecord?.apply { stop(); release() }
+        audioRecord = null
+        listener?.onRecordingStopped()
     }
 
     fun cleanup() {
         stopRecording()
         interpreter?.close()
-        interpreter = null
-        Log.d(TAG, "🧹 تم تنظيف الموارد")
     }
 
     companion object {
