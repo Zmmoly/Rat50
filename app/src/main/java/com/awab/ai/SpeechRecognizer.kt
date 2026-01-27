@@ -26,8 +26,8 @@ class SpeechRecognizer(private val context: Context) {
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
     private val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
     
-    // النموذج v19 Ultimate يتوقع 8 ثوانٍ من الصوت الخام (16000 * 8)
-    private val requiredSamples = 128000 
+    // التعديل: تحديد الحجم المطلوب للنموذج v19 وهو 8 ثوانٍ (128000 عينة)
+    private val requiredSamples = 128000
     
     interface RecognitionListener {
         fun onTextRecognized(text: String)
@@ -43,37 +43,67 @@ class SpeechRecognizer(private val context: Context) {
     fun setListener(listener: RecognitionListener) {
         this.listener = listener
     }
-
-    fun isModelLoaded(): Boolean = interpreter != null
+    
+    fun isModelLoaded(): Boolean {
+        return interpreter != null
+    }
 
     /**
-     * تحميل النموذج مع توسيع الأبعاد وتفعيل الـ Flex
+     * تحميل نموذج من ملف خارجي
+     * تم التعديل لإضافة FlexDelegate وتغيير حجم الإدخال (Resize)
      */
     fun loadModelFromFile(filePath: String): Boolean {
         return try {
             val file = File(filePath)
-            if (!file.exists()) return false
+            if (!file.exists()) {
+                listener?.onError("الملف غير موجود")
+                return false
+            }
             
             val modelBuffer = loadModelFromPath(file)
             
+            // التعديل: تفعيل الـ FlexDelegate الضروري لفك تشفير CTC في v19
             val options = Interpreter.Options().apply {
                 setNumThreads(4)
-                // ✅ ضروري جداً لفك تشفير مخرجات v19
-                addDelegate(FlexDelegate()) 
+                addDelegate(FlexDelegate())
             }
             
             interpreter = Interpreter(modelBuffer, options)
             
-            // ✅ توسيع "البوابة" لتستوعب الـ 128,000 عينة (512,000 بايت)
+            // التعديل الجوهري: توسيع "البوابة" لتستوعب الصوت الخام (8 ثوانٍ)
+            // هذا يحل خطأ (772 bytes vs 512,000 bytes)
             interpreter?.resizeInput(0, intArrayOf(1, requiredSamples))
             interpreter?.allocateTensors()
             
-            Log.d(TAG, "✅ تم ضبط النموذج v19 لاستقبال 8 ثوانٍ من الصوت")
             listener?.onModelLoaded(file.name)
             true
         } catch (e: Exception) {
-            Log.e(TAG, "❌ فشل التحميل: ${e.message}")
-            listener?.onError("خطأ في تحميل النموذج")
+            listener?.onError("فشل تحميل النموذج: ${e.message}")
+            false
+        }
+    }
+    
+    /**
+     * تحميل نموذج من assets
+     */
+    fun loadModelFromAssets(modelFileName: String = "speech_model.tflite"): Boolean {
+        return try {
+            val modelBuffer = loadModelFromAssetsInternal(modelFileName)
+            val options = Interpreter.Options().apply {
+                setNumThreads(4)
+                addDelegate(FlexDelegate())
+            }
+            
+            interpreter = Interpreter(modelBuffer, options)
+            
+            // التعديل الجوهري: توسيع "البوابة" لتناسب الصوت الخام
+            interpreter?.resizeInput(0, intArrayOf(1, requiredSamples))
+            interpreter?.allocateTensors()
+            
+            listener?.onModelLoaded(modelFileName)
+            true
+        } catch (e: Exception) {
+            listener?.onError("لم يتم العثور على النموذج في assets")
             false
         }
     }
@@ -83,23 +113,22 @@ class SpeechRecognizer(private val context: Context) {
         val fileChannel = inputStream.channel
         return fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileChannel.size())
     }
+    
+    private fun loadModelFromAssetsInternal(modelFileName: String): MappedByteBuffer {
+        val fileDescriptor = context.assets.openFd(modelFileName)
+        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
+        val fileChannel = inputStream.channel
+        val startOffset = fileDescriptor.startOffset
+        val declaredLength = fileDescriptor.declaredLength
+        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+    }
 
     fun startRecording() {
         if (isRecording || interpreter == null) return
 
         try {
-            audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                sampleRate,
-                channelConfig,
-                audioFormat,
-                bufferSize
-            )
-
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                listener?.onError("الميكروفون غير جاهز")
-                return
-            }
+            audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, channelConfig, audioFormat, bufferSize)
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) return
 
             isRecording = true
             audioRecord?.startRecording()
@@ -107,13 +136,25 @@ class SpeechRecognizer(private val context: Context) {
             
             Thread { recordAndRecognize() }.start()
         } catch (e: Exception) {
-            listener?.onError("خطأ في التسجيل: ${e.message}")
+            isRecording = false
         }
+    }
+
+    fun stopRecording() {
+        if (!isRecording) return
+        isRecording = false
+        try {
+            audioRecord?.stop()
+            audioRecord?.release()
+            audioRecord = null
+            listener?.onRecordingStopped()
+        } catch (e: Exception) { }
     }
 
     private fun recordAndRecognize() {
         val audioBuffer = ShortArray(bufferSize)
         val audioData = mutableListOf<Short>()
+        val minSize = requiredSamples / 4 
         
         try {
             while (isRecording) {
@@ -124,32 +165,34 @@ class SpeechRecognizer(private val context: Context) {
                     
                     for (i in 0 until readSize) audioData.add(audioBuffer[i])
                     
-                    // إذا وصل التسجيل لـ 8 ثوانٍ، عالجه تلقائياً
                     if (audioData.size >= requiredSamples) {
-                        processChunk(audioData.take(requiredSamples).toShortArray())
+                        val text = recognizeSpeech(audioData.take(requiredSamples).toShortArray())
+                        if (text.isNotBlank()) listener?.onTextRecognized(text)
                         audioData.clear()
                     }
                 }
             }
-            // معالجة ما تبقى عند الضغط على Stop
-            if (audioData.isNotEmpty()) processChunk(audioData.toShortArray())
-        } catch (e: Exception) {
-            Log.e(TAG, "خطأ في حلقة التسجيل: ${e.message}")
-        }
+            // معالجة المتبقي عند الإيقاف
+            if (audioData.size >= minSize) {
+                val text = recognizeSpeech(audioData.toShortArray())
+                if (text.isNotBlank()) listener?.onTextRecognized(text)
+            }
+        } catch (e: Exception) { }
     }
 
-    private fun processChunk(audioArray: ShortArray) {
-        val text = recognizeSpeech(audioArray)
-        if (text.isNotBlank()) listener?.onTextRecognized(text)
+    private fun calculateVolume(buffer: ShortArray, size: Int): Float {
+        var sum = 0.0
+        for (i in 0 until size) sum += (buffer[i] * buffer[i]).toDouble()
+        return (sqrt(sum / size) / Short.MAX_VALUE).toFloat()
     }
 
     private fun recognizeSpeech(audioData: ShortArray): String {
         return try {
-            // 1. تجهيز الـ Buffer بحجم 512,000 بايت (128,000 float)
+            // التعديل: تجهيز الـ Buffer ليتناسب مع الحجم المحدث (128000)
             val inputBuffer = ByteBuffer.allocateDirect(requiredSamples * 4)
             inputBuffer.order(ByteOrder.nativeOrder())
             
-            // تحويل الصوت لـ Float وتطبيعه (-1.0 إلى 1.0) مع حشو الباقي أصفار
+            // تحويل الصوت وتطبيعه مع حشو الباقي بالأصفار (Padding)
             for (i in 0 until requiredSamples) {
                 if (i < audioData.size) {
                     inputBuffer.putFloat(audioData[i] / 32768.0f)
@@ -159,32 +202,21 @@ class SpeechRecognizer(private val context: Context) {
             }
             inputBuffer.rewind()
             
-            // 2. تجهيز مخرجات النموذج (Indices)
             val outputShape = interpreter?.getOutputTensor(0)?.shape() ?: intArrayOf(1, 100)
             val outputBuffer = IntArray(outputShape[1])
             
-            // 3. تشغيل المعالجة
             interpreter?.run(inputBuffer, outputBuffer)
             
             decodeCTCOutput(outputBuffer)
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ خطأ معالجة: ${e.message}")
-            ""
-        }
+        } catch (e: Exception) { "" }
     }
-
-    /**
-     * فك تشفير CTC لتحويل الأرقام إلى نصوص سودانية
-     */
+    
     private fun decodeCTCOutput(indices: IntArray): String {
         val vocabulary = loadVocabulary()
-        if (vocabulary.isEmpty()) return "خطأ: قاموس الحروف مفقود"
-        
         val result = StringBuilder()
         var lastIdx = -1
         
         for (idx in indices) {
-            // تخطي الفراغ (0) والمكرر حسب قواعد CTC
             if (idx == 0 || idx == lastIdx) {
                 lastIdx = idx
                 continue
@@ -200,28 +232,7 @@ class SpeechRecognizer(private val context: Context) {
     private fun loadVocabulary(): List<String> {
         return try {
             context.assets.open("vocabulary.txt").bufferedReader().readLines().map { it.trim() }
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ لم يتم العثور على vocabulary.txt في assets")
-            emptyList()
-        }
-    }
-
-    private fun calculateVolume(buffer: ShortArray, size: Int): Float {
-        var sum = 0.0
-        for (i in 0 until size) sum += (buffer[i] * buffer[i]).toDouble()
-        return (sqrt(sum / size) / Short.MAX_VALUE).toFloat()
-    }
-
-    fun stopRecording() {
-        isRecording = false
-        audioRecord?.apply { 
-            if (state == AudioRecord.STATE_INITIALIZED) {
-                stop()
-                release()
-            }
-        }
-        audioRecord = null
-        listener?.onRecordingStopped()
+        } catch (e: Exception) { emptyList() }
     }
 
     fun cleanup() {
