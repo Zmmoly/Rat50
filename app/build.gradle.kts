@@ -16,20 +16,15 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         
-        // تقليل حجم التطبيق - استخدام معمارية واحدة فقط
+        // تقليل حجم التطبيق - استهداف معمارية arm64 فقط (أغلب الأجهزة الحديثة)
         ndk {
             abiFilters.addAll(listOf("arm64-v8a"))
         }
     }
 
-    // إضافة هذا الجزء ضروري جداً لضمان قراءة الموديل من الـ Assets
-    @Suppress("UnstableApiUsage")
-    androidResources {
-        noCompress += "tflite"
-    }
-
     signingConfigs {
         create("release") {
+            // ملاحظة: تأكد من وجود ملف debug.keystore في مجلد المشروع
             storeFile = file("debug.keystore")
             storePassword = "android"
             keyAlias = "androiddebugkey"
@@ -38,9 +33,9 @@ android {
     }
 
     buildTypes {
-        release {
-            isMinifyEnabled = true
-            isShrinkResources = true
+        getByName("release") {
+            isMinifyEnabled = true      // إزالة الكود غير المستخدم
+            isShrinkResources = true    // إزالة الموارد (الصور/الملفات) غير المستخدمة
             signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -60,18 +55,20 @@ android {
     
     buildFeatures {
         viewBinding = true
-        mlModelBinding = true
+        mlModelBinding = true // مهم جداً للتعامل مع ملفات .tflite بسهولة
     }
 }
 
 dependencies {
+    // AndroidX & UI
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     implementation("androidx.activity:activity-ktx:1.8.2")
     
-    // تم الإبقاء على المكتبات الأساسية وحذف select-tf-ops لتوفير المساحة
+    // TensorFlow Lite - مكتبات الذكاء الاصطناعي
     implementation("org.tensorflow:tensorflow-lite:2.14.0")
     implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
+    implementation("org.tensorflow:tensorflow-lite-select-tf-ops:2.14.0")
 }
