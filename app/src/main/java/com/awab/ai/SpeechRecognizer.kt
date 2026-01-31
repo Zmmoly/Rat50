@@ -12,8 +12,11 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
-import kotlin.math.log10
 import kotlin.math.sqrt
+import kotlin.math.ln
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.exp
 
 class SpeechRecognizer(private val context: Context) {
 
@@ -26,6 +29,20 @@ class SpeechRecognizer(private val context: Context) {
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
     private val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
     
+    // قائمة الأحرف - مطابقة تماماً لكود التدريب
+    // [" ", "أ", "ب", "ت", "ث", "ج", "ح", "خ", "د", "ذ", "ر", "ز", "س", "ش", "ص", "ض", "ط", "ظ", "ع", "غ", "ف", "ق", "ك", "ل", "م", "ن", "هـ", "و", "ي", "ة", "ى", "ئ", "ء", "ؤ", "آ", "لا"]
+    companion object {
+        private const val TAG = "SpeechRecognizer"
+        
+        // قائمة الأحرف الثابتة
+        private val CHAR_LIST = listOf(
+            " ", "أ", "ب", "ت", "ث", "ج", "ح", "خ", "د", "ذ", 
+            "ر", "ز", "س", "ش", "ص", "ض", "ط", "ظ", "ع", "غ", 
+            "ف", "ق", "ك", "ل", "م", "ن", "هـ", "و", "ي", 
+            "ة", "ى", "ئ", "ء", "ؤ", "آ", "لا"
+        )
+    }
+    
     interface RecognitionListener {
         fun onTextRecognized(text: String)
         fun onError(error: String)
@@ -36,20 +53,72 @@ class SpeechRecognizer(private val context: Context) {
     }
     
     private var listener: RecognitionListener? = null
-    fun setListener(listener: RecognitionListener) { this.listener = listener }
-
-    fun isModelLoaded(): Boolean = interpreter != null
+    
+    fun setListener(listener: RecognitionListener) {
+        this.listener = listener
+    }
+    
+    fun isModelLoaded(): Boolean {
+        return interpreter != null
+    }
 
     fun loadModelFromFile(filePath: String): Boolean {
         return try {
             val file = File(filePath)
+            if (!file.exists()) {
+                Log.e(TAG, "❌ الملف غير موجود: $filePath")
+                listener?.onError("الملف غير موجود")
+                return false
+            }
+            
+            if (!file.name.endsWith(".tflite")) {
+                Log.e(TAG, "❌ صيغة خاطئة: ${file.name}")
+                listener?.onError("الملف يجب أن يكون بصيغة .tflite")
+                return false
+            }
+            
+            Log.d(TAG, "📂 محاولة تحميل: ${file.name} (${file.length()} bytes)")
+            
             val modelBuffer = loadModelBuffer(file)
-            val options = Interpreter.Options().apply { setNumThreads(4) }
+            val options = Interpreter.Options().apply {
+                setNumThreads(4)
+            }
+            
             interpreter = Interpreter(modelBuffer, options)
+            
+            // طباعة معلومات النموذج
+            val inputDetails = interpreter?.getInputTensor(0)
+            val outputDetails = interpreter?.getOutputTensor(0)
+            Log.d(TAG, "📊 Input shape: ${inputDetails?.shape()?.contentToString()}")
+            Log.d(TAG, "📊 Output shape: ${outputDetails?.shape()?.contentToString()}")
+            
+            Log.d(TAG, "✅ تم تحميل النموذج: ${file.name}")
             listener?.onModelLoaded(file.name)
             true
+            
         } catch (e: Exception) {
-            listener?.onError("فشل التحميل: ${e.message}")
+            Log.e(TAG, "❌ فشل تحميل النموذج: ${e.message}")
+            Log.e(TAG, "Stack trace:", e)
+            listener?.onError("فشل تحميل النموذج: ${e.message}")
+            false
+        }
+    }
+    
+    fun loadModelFromAssets(modelFileName: String = "speech_model.tflite"): Boolean {
+        return try {
+            val modelBuffer = loadModelFromAssetsBuffer(modelFileName)
+            val options = Interpreter.Options().apply {
+                setNumThreads(4)
+            }
+            interpreter = Interpreter(modelBuffer, options)
+            
+            Log.d(TAG, "✅ تم تحميل النموذج من assets: $modelFileName")
+            listener?.onModelLoaded(modelFileName)
+            true
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ فشل تحميل النموذج من assets: ${e.message}")
+            listener?.onError("لم يتم العثور على النموذج في assets")
             false
         }
     }
@@ -59,144 +128,360 @@ class SpeechRecognizer(private val context: Context) {
         val fileChannel = inputStream.channel
         return fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileChannel.size())
     }
+    
+    private fun loadModelFromAssetsBuffer(modelFileName: String): MappedByteBuffer {
+        val fileDescriptor = context.assets.openFd(modelFileName)
+        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
+        val fileChannel = inputStream.channel
+        val startOffset = fileDescriptor.startOffset
+        val declaredLength = fileDescriptor.declaredLength
+        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+    }
 
     fun startRecording() {
-        if (isRecording || interpreter == null) return
+        if (isRecording) {
+            Log.w(TAG, "⚠️ التسجيل قيد العمل بالفعل")
+            return
+        }
+        
+        if (interpreter == null) {
+            listener?.onError("يرجى تحميل النموذج أولاً")
+            return
+        }
+
         try {
-            audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, channelConfig, audioFormat, bufferSize)
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                sampleRate,
+                channelConfig,
+                audioFormat,
+                bufferSize
+            )
+
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                listener?.onError("فشل تهيئة التسجيل الصوتي")
+                return
+            }
+
             isRecording = true
             audioRecord?.startRecording()
             listener?.onRecordingStarted()
-            Thread { recordAndRecognize() }.start()
+            
+            Log.d(TAG, "🎤 بدأ التسجيل...")
+
+            Thread {
+                recordAndRecognize()
+            }.start()
+
         } catch (e: Exception) {
-            listener?.onError("خطأ: ${e.message}")
+            Log.e(TAG, "❌ خطأ في بدء التسجيل: ${e.message}")
+            listener?.onError("فشل بدء التسجيل: ${e.message}")
+            isRecording = false
         }
     }
 
     fun stopRecording() {
+        if (!isRecording) {
+            return
+        }
+
         isRecording = false
-        audioRecord?.stop()
-        audioRecord?.release()
-        audioRecord = null
-        listener?.onRecordingStopped()
+        
+        try {
+            audioRecord?.stop()
+            audioRecord?.release()
+            audioRecord = null
+            
+            listener?.onRecordingStopped()
+            Log.d(TAG, "🛑 توقف التسجيل")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ خطأ في إيقاف التسجيل: ${e.message}")
+        }
     }
 
     private fun recordAndRecognize() {
         val audioBuffer = ShortArray(bufferSize)
         val audioData = mutableListOf<Short>()
         
-        while (isRecording) {
-            val readSize = audioRecord?.read(audioBuffer, 0, bufferSize) ?: 0
-            if (readSize > 0) {
-                listener?.onVolumeChanged(computeVolume(audioBuffer, readSize))
-                for (i in 0 until readSize) audioData.add(audioBuffer[i])
+        val recognizedText = StringBuilder()
+        var silenceCount = 0
+        val silenceThreshold = 0.01f
+        
+        // مدة النافذة: 2-3 ثواني (كما في كود الاختبار)
+        val windowDuration = 2.5f // ثانية
+        val windowSize = (sampleRate * windowDuration).toInt()
+        
+        Log.d(TAG, "📊 بدء التسجيل - windowSize: $windowSize, sampleRate: $sampleRate")
+        
+        try {
+            while (isRecording) {
+                val readSize = audioRecord?.read(audioBuffer, 0, bufferSize) ?: 0
                 
-                // نقوم بالتعرف عند اكتمال نافذة صوتية (مثلاً 2 ثانية)
-                if (audioData.size >= sampleRate * 2) {
-                    val windowData = audioData.take(sampleRate * 2).toShortArray()
-                    val text = recognizeSpeech(windowData)
-                    if (text.isNotEmpty()) listener?.onTextRecognized(text)
-                    audioData.clear() 
-                }
-            }
-        }
-    }
-
-    // --- الجزء المعدل ليتوافق مع كود الاختبار (المدخلات فقط) ---
-    
-    private fun recognizeSpeech(audioData: ShortArray): String {
-        return try {
-            val inputBuffer = prepareInputBuffer(audioData)
-            
-            // الموديل في كود الاختبار يخرج مصفوفة Indices مباشرة
-            val outputDetails = interpreter!!.getOutputTensor(0)
-            val outputShape = outputDetails.shape() 
-            val outputBuffer = IntArray(outputShape[1]) 
-            
-            interpreter?.run(inputBuffer, outputBuffer)
-            
-            processIndices(outputBuffer)
-        } catch (e: Exception) { "" }
-    }
-
-    private fun prepareInputBuffer(audioData: ShortArray): ByteBuffer {
-        // 1. التطبيع (Normalize)
-        val floats = FloatArray(audioData.size) { audioData[it].toFloat() / 32768f }
-        
-        // 2. تحويل STFT (نفس إعدادات كاجل: 384, 160, 256)
-        val stft = computeSTFT(floats)
-        
-        val timeSteps = stft.size
-        val nFreqs = stft[0].size
-        val buffer = ByteBuffer.allocateDirect(timeSteps * nFreqs * 4)
-        buffer.order(ByteOrder.nativeOrder())
-        
-        // 3. التحويل لـ dB والتطبيع النهائي: (spec + 80) / 80
-        for (t in 0 until timeSteps) {
-            for (f in 0 until nFreqs) {
-                val db = 20f * log10(stft[t][f] + 1e-10f)
-                val normalized = (db + 80f) / 80f
-                buffer.putFloat(normalized.coerceIn(0f, 1f))
-            }
-        }
-        buffer.rewind()
-        return buffer
-    }
-
-    private fun computeSTFT(audio: FloatArray): Array<FloatArray> {
-        val nFFT = 384
-        val hopLength = 160
-        val winLength = 256
-        val numFrames = (audio.size - nFFT) / hopLength + 1
-        val fftSize = nFFT / 2 + 1
-        val spec = Array(numFrames) { FloatArray(fftSize) }
-        
-        for (frame in 0 until numFrames) {
-            val start = frame * hopLength
-            for (k in 0 until fftSize) {
-                var real = 0f
-                var imag = 0f
-                for (n in 0 until winLength) {
-                    if (start + n < audio.size) {
-                        val angle = -2.0 * Math.PI * k * n / nFFT
-                        val window = 0.5 * (1.0 - Math.cos(2.0 * Math.PI * n / (winLength - 1)))
-                        val sample = audio[start + n] * window
-                        real += (sample * Math.cos(angle)).toFloat()
-                        imag += (sample * Math.sin(angle)).toFloat()
+                if (readSize > 0) {
+                    // حساب مستوى الصوت
+                    val volume = computeVolume(audioBuffer, readSize)
+                    listener?.onVolumeChanged(volume)
+                    
+                    val isSilent = volume < silenceThreshold
+                    
+                    if (isSilent) {
+                        silenceCount++
+                        // إذا صمت طويل (أكثر من ثانية) وعندنا كلام، أرسل النتيجة
+                        if (silenceCount > 30 && recognizedText.isNotEmpty()) {
+                            val finalText = recognizedText.toString().trim()
+                            Log.d(TAG, "📝 نص نهائي: $finalText")
+                            listener?.onTextRecognized(finalText)
+                            recognizedText.clear()
+                            audioData.clear()
+                            silenceCount = 0
+                        }
+                    } else {
+                        silenceCount = 0
+                    }
+                    
+                    // إضافة البيانات للمخزن
+                    for (i in 0 until readSize) {
+                        audioData.add(audioBuffer[i])
+                    }
+                    
+                    // عند امتلاء النافذة، قم بالتعرف
+                    if (audioData.size >= windowSize) {
+                        val windowData = audioData.take(windowSize).toShortArray()
+                        
+                        val text = recognizeSpeech(windowData)
+                        
+                        if (text.isNotBlank()) {
+                            recognizedText.append(text)
+                            Log.d(TAG, "🔤 تم التعرف: $text")
+                            listener?.onTextRecognized(recognizedText.toString())
+                        }
+                        
+                        // مسح البيانات القديمة
+                        audioData.clear()
                     }
                 }
-                spec[frame][k] = sqrt(real * real + imag * imag)
             }
-        }
-        return spec
-    }
-
-    private fun processIndices(indices: IntArray): String {
-        val vocabulary = loadVocabulary()
-        val result = StringBuilder()
-        for (idx in indices) {
-            // منطق كود الاختبار: char_list[idx-1]
-            if (idx > 0 && (idx - 1) < vocabulary.size) {
-                result.append(vocabulary[idx - 1])
+            
+            // إرسال أي نص متبقي عند التوقف
+            if (recognizedText.isNotEmpty()) {
+                val finalText = recognizedText.toString().trim()
+                Log.d(TAG, "📝 نص نهائي عند التوقف: $finalText")
+                listener?.onTextRecognized(finalText)
             }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ خطأ أثناء التسجيل: ${e.message}")
+            listener?.onError("خطأ أثناء التسجيل")
         }
-        return result.toString()
-    }
-
-    private fun loadVocabulary(): List<String> {
-        return listOf(
-            " ", "أ", "ب", "ت", "ث", "ج", "ح", "خ", "د", "ذ", "ر", "ز", "س", "ش", "ص", "ض", "ط", "ظ", "ع", "غ", "ف", "ق", "ك", "ل", "م", "ن", "هـ", "و", "ي", "ة", "ى", "ئ", "ء", "ؤ", "آ", "لا"
-        )
     }
 
     private fun computeVolume(buffer: ShortArray, size: Int): Float {
         var sum = 0.0
-        for (i in 0 until size) sum += (buffer[i] * buffer[i]).toDouble()
-        return (sqrt(sum / size) / Short.MAX_VALUE).toFloat()
+        for (i in 0 until size) {
+            sum += (buffer[i] * buffer[i]).toDouble()
+        }
+        val rms = sqrt(sum / size)
+        return (rms / Short.MAX_VALUE).toFloat()
     }
 
-    fun release() {
+    /**
+     * التعرف على الكلام - متطابق مع منطق كود الاختبار
+     */
+    private fun recognizeSpeech(audioData: ShortArray): String {
+        try {
+            // 1. تحويل الصوت لـ Spectrogram (مثل preprocess_audio في Python)
+            val features = preprocessAudio(audioData)
+            
+            // 2. تحضير المدخلات
+            val inputDetails = interpreter?.getInputTensor(0)
+            val inputShape = inputDetails?.shape() ?: return ""
+            
+            // 3. تحضير buffer المدخلات بالشكل الصحيح
+            val batchSize = 1
+            val timeSteps = features.data.size
+            val nFeatures = if (features.data.isNotEmpty()) features.data[0].size else 0
+            
+            val inputBuffer = ByteBuffer.allocateDirect(batchSize * timeSteps * nFeatures * 4)
+            inputBuffer.order(ByteOrder.nativeOrder())
+            
+            for (t in 0 until timeSteps) {
+                for (f in 0 until nFeatures) {
+                    inputBuffer.putFloat(features.data[t][f])
+                }
+            }
+            inputBuffer.rewind()
+            
+            // resize tensor إذا كان الشكل مختلف
+            val requiredShape = intArrayOf(batchSize, timeSteps, nFeatures)
+            interpreter?.resizeInput(0, requiredShape)
+            interpreter?.allocateTensors()
+            
+            // 4. تحضير المخرجات
+            val outputDetails = interpreter?.getOutputTensor(0)
+            val outputShape = outputDetails?.shape() ?: return ""
+            
+            // المخرج هو مصفوفة من الأرقام (indices)
+            val outputSize = outputShape.fold(1) { acc, dim -> acc * dim }
+            val outputArray = IntArray(outputSize)
+            
+            // 5. تشغيل النموذج
+            interpreter?.run(inputBuffer, outputArray)
+            
+            // 6. فك التشفير - تحويل الأرقام لنص
+            val decodedText = decodeIndices(outputArray)
+            
+            Log.d(TAG, "🎯 Indices: ${outputArray.take(20).joinToString()}")
+            Log.d(TAG, "📝 Decoded: $decodedText")
+            
+            return decodedText
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ خطأ في التعرف: ${e.message}", e)
+            return ""
+        }
+    }
+    
+    /**
+     * معالجة الصوت - مطابق لـ preprocess_audio في Python
+     */
+    private fun preprocessAudio(audioData: ShortArray): Spectrogram {
+        // 1. تطبيع الصوت
+        val audio = normalizeAudio(audioData)
+        
+        // 2. STFT
+        val nFFT = 384
+        val hopLength = 160
+        val winLength = 256
+        val stft = computeSTFT(audio, nFFT, hopLength, winLength)
+        
+        // 3. تحويل لـ dB
+        val specDB = amplitudeToDb(stft)
+        
+        // 4. التطبيع: (spec + 80) / 80
+        val normalized = Array(specDB.size) { t ->
+            FloatArray(specDB[t].size) { f ->
+                (specDB[t][f] + 80f) / 80f
+            }
+        }
+        
+        return Spectrogram(
+            data = normalized,
+            shape = intArrayOf(1, normalized.size, normalized[0].size)
+        )
+    }
+    
+    private fun normalizeAudio(audioData: ShortArray): FloatArray {
+        // تحويل لـ float وتطبيع
+        val floatData = FloatArray(audioData.size) { i ->
+            audioData[i].toFloat() / Short.MAX_VALUE
+        }
+        
+        // Normalize: audio / max(abs(audio))
+        val maxAbs = floatData.maxOf { kotlin.math.abs(it) }
+        return if (maxAbs > 0) {
+            FloatArray(floatData.size) { i -> floatData[i] / maxAbs }
+        } else {
+            floatData
+        }
+    }
+    
+    private fun computeSTFT(audio: FloatArray, nFFT: Int, hopLength: Int, winLength: Int): Array<FloatArray> {
+        val numFrames = (audio.size - nFFT) / hopLength + 1
+        val fftSize = nFFT / 2 + 1
+        
+        val stft = Array(numFrames) { FloatArray(fftSize) }
+        
+        // Hann window
+        val window = FloatArray(winLength) { i ->
+            0.5f * (1f - cos(2f * Math.PI.toFloat() * i / (winLength - 1)))
+        }
+        
+        for (frame in 0 until numFrames) {
+            val start = frame * hopLength
+            val fftInput = FloatArray(nFFT) { 0f }
+            
+            // تطبيق النافذة
+            for (i in 0 until kotlin.math.min(winLength, audio.size - start)) {
+                fftInput[i] = audio[start + i] * window[i]
+            }
+            
+            // FFT بسيط (Magnitude only)
+            for (k in 0 until fftSize) {
+                var real = 0f
+                var imag = 0f
+                
+                for (n in 0 until nFFT) {
+                    val angle = -2f * Math.PI.toFloat() * k * n / nFFT
+                    real += fftInput[n] * cos(angle)
+                    imag += fftInput[n] * sin(angle)
+                }
+                
+                // Magnitude
+                stft[frame][k] = kotlin.math.sqrt(real * real + imag * imag)
+            }
+        }
+        
+        return stft
+    }
+    
+    private fun amplitudeToDb(stft: Array<FloatArray>): Array<FloatArray> {
+        val refValue = stft.maxOf { frame -> frame.maxOrNull() ?: 0f }
+        
+        return Array(stft.size) { t ->
+            FloatArray(stft[t].size) { f ->
+                val magnitude = stft[t][f]
+                20f * ln((magnitude + 1e-10f) / (refValue + 1e-10f)) / ln(10f)
+            }
+        }
+    }
+    
+    /**
+     * فك التشفير - مطابق لمنطق run_test في Python
+     * decoded_text = "".join([char_list[idx-1] for idx in indices if 0 < idx <= len(char_list)])
+     */
+    private fun decodeIndices(indices: IntArray): String {
+        val result = StringBuilder()
+        
+        for (idx in indices) {
+            // idx - 1 لأن النموذج يعيد أرقام من 1 إلى 37
+            // 0 يعني blank/padding
+            if (idx > 0 && idx <= CHAR_LIST.size) {
+                val char = CHAR_LIST[idx - 1]
+                result.append(char)
+            }
+        }
+        
+        return result.toString().trim()
+    }
+    
+    private fun floatArrayToByteBuffer(data: Array<FloatArray>): ByteBuffer {
+        val totalSize = data.sumOf { it.size }
+        val buffer = ByteBuffer.allocateDirect(totalSize * 4)
+        buffer.order(ByteOrder.nativeOrder())
+        
+        for (row in data) {
+            for (value in row) {
+                buffer.putFloat(value)
+            }
+        }
+        
+        buffer.rewind()
+        return buffer
+    }
+    
+    fun cleanup() {
         stopRecording()
         interpreter?.close()
+        interpreter = null
+        Log.d(TAG, "🧹 تم تنظيف الموارد")
     }
+    
+    // للتوافق مع الكود القديم
+    fun release() = cleanup()
+    
+    // Data class for spectrogram
+    private data class Spectrogram(
+        val data: Array<FloatArray>,
+        val shape: IntArray
+    )
 }
